@@ -16,8 +16,88 @@ local prefDefaults = {
 
 local db
 local endTime, total, queueWindow = 0, 1, 0.4
+local gcdSecret = false
 local curColor
 local secretWarned = false
+
+-- GCD idle tracking: merge busy intervals (GCDs, casts, channels) and sum the gaps
+local MIN_FIGHT = 10 -- seconds; shorter fights aren't reported
+local combatStart -- nil when out of combat
+local winStart, busyUntil, idle = nil, 0, 0
+
+local function Print(msg)
+    print("|cffffcc00GCDBar:|r " .. msg)
+end
+
+local function AnySecret(...)
+    if not issecretvalue then return false end
+    for i = 1, select("#", ...) do
+        if issecretvalue((select(i, ...))) then return true end
+    end
+    return false
+end
+
+local function MarkBusy(s, e)
+    if not combatStart then return end
+    if not winStart then
+        winStart = math.max(s, combatStart)
+        busyUntil, idle = winStart, 0
+    end
+    if s > busyUntil then idle = idle + s - busyUntil end
+    if e > busyUntil then busyUntil = e end
+end
+
+local function MarkCast()
+    if not combatStart then return end
+    local _, _, _, s, e = UnitCastingInfo("player")
+    if not s then _, _, _, s, e = UnitChannelInfo("player") end
+    if not s or AnySecret(s, e) then return end
+    MarkBusy(s / 1000, e / 1000)
+end
+
+-- cast ended early (interrupt, cancel): drop the predicted remainder,
+-- then re-mark any cast that already started (stop/start can arrive out of order)
+local function TrimBusy()
+    busyUntil = math.min(busyUntil, math.max(GetTime(), endTime))
+    MarkCast()
+end
+
+-- read the GCD into endTime/total and feed the tracker; true while it is running
+local function ReadGCD()
+    local cd = C_Spell.GetSpellCooldown(GCD_SPELL)
+    gcdSecret = cd and AnySecret(cd.startTime, cd.duration, cd.isEnabled, cd.modRate)
+    if gcdSecret and not secretWarned then
+        secretWarned = true
+        Print("GCD values are secret on this patch, bar disabled.")
+    end
+    if not cd or gcdSecret or not cd.isEnabled or cd.duration == 0 then
+        endTime = 0
+        return false
+    end
+    total = cd.duration / (cd.modRate or 1)
+    endTime = cd.startTime + total
+    MarkBusy(cd.startTime, endTime)
+    return true
+end
+
+local function PrintFight(f)
+    Print(("%.1f%% GCD idle (%d:%02d)"):format(f.pct, math.floor(f.len / 60), math.floor(f.len % 60)))
+end
+
+local function StartFight()
+    combatStart, winStart = GetTime(), nil
+    MarkCast()
+    ReadGCD()
+end
+
+local function EndFight()
+    combatStart = nil
+    if not winStart then return end
+    local len = busyUntil - winStart
+    if len < MIN_FIGHT then return end
+    db.lastFight = { pct = idle / len * 100, len = len }
+    PrintFight(db.lastFight)
+end
 
 local bar = CreateFrame("StatusBar", "GCDBarFrame", UIParent)
 bar:SetStatusBarTexture(TEX)
@@ -84,32 +164,18 @@ local function OnUpdate(self)
     SetColor(remaining <= queueWindow and COLOR_QUEUE or COLOR_GCD)
 end
 
+-- draw the bar from the last ReadGCD() state
 local function Refresh()
     if not db or not db.locked then return end
-
-    local cd = C_Spell.GetSpellCooldown(GCD_SPELL)
-    if not cd then
-        Idle()
-        return
-    end
-
-    if issecretvalue and (issecretvalue(cd.startTime) or issecretvalue(cd.duration)
-            or issecretvalue(cd.isEnabled) or issecretvalue(cd.modRate)) then
-        if not secretWarned then
-            secretWarned = true
-            print("|cffffcc00GCDBar:|r GCD values are secret on this patch, bar disabled.")
-        end
+    if gcdSecret then
         bar:Hide()
         return
     end
-
-    if not cd.isEnabled or cd.duration == 0 then
+    if endTime <= GetTime() then
         Idle()
         return
     end
 
-    total = cd.duration / (cd.modRate or 1)
-    endTime = cd.startTime + total
     queueWindow = (tonumber(GetCVar("SpellQueueWindow")) or 400) / 1000
 
     local qPct = math.min(queueWindow / total, 1)
@@ -157,7 +223,20 @@ bar:RegisterEvent("SPELL_UPDATE_COOLDOWN")
 bar:RegisterEvent("PLAYER_REGEN_DISABLED")
 bar:RegisterEvent("PLAYER_REGEN_ENABLED")
 
+local CAST_EVENTS = {
+    UNIT_SPELLCAST_START = MarkCast, UNIT_SPELLCAST_DELAYED = MarkCast,
+    UNIT_SPELLCAST_CHANNEL_START = MarkCast, UNIT_SPELLCAST_CHANNEL_UPDATE = MarkCast,
+    UNIT_SPELLCAST_EMPOWER_START = MarkCast, UNIT_SPELLCAST_EMPOWER_UPDATE = MarkCast,
+    UNIT_SPELLCAST_STOP = TrimBusy, UNIT_SPELLCAST_INTERRUPTED = TrimBusy,
+    UNIT_SPELLCAST_CHANNEL_STOP = TrimBusy, UNIT_SPELLCAST_EMPOWER_STOP = TrimBusy,
+}
+for event in pairs(CAST_EVENTS) do bar:RegisterUnitEvent(event, "player") end
+
 bar:SetScript("OnEvent", function(self, event, arg1)
+    if CAST_EVENTS[event] then
+        CAST_EVENTS[event]()
+        return
+    end
     if event == "ADDON_LOADED" then
         if arg1 ~= ADDON then return end
         GCDBarDB = GCDBarDB or {}
@@ -167,12 +246,23 @@ bar:SetScript("OnEvent", function(self, event, arg1)
                 if db[k] == nil then db[k] = v end
             end
         end
+        self:UnregisterEvent("ADDON_LOADED")
+        if UnitAffectingCombat("player") then -- /reload mid-fight
+            StartFight()
+        else
+            ReadGCD()
+        end
         ApplyLayout()
         SetLocked(db.locked)
-        self:UnregisterEvent("ADDON_LOADED")
+        return
+    elseif event == "PLAYER_REGEN_DISABLED" then
+        StartFight()
+    elseif event == "PLAYER_REGEN_ENABLED" then
+        EndFight()
     else
-        Refresh()
+        ReadGCD()
     end
+    Refresh()
 end)
 
 local HELP = {
@@ -181,6 +271,7 @@ local HELP = {
     "/gcd size <width> <height>",
     "/gcd idle - toggle empty bar while in combat",
     "/gcd reset - default position and size",
+    "/gcd stats - GCD idle % of the last fight",
 }
 
 SLASH_GCDBAR1 = "/gcd"
@@ -194,7 +285,7 @@ SlashCmdList.GCDBAR = function(msg)
     elseif cmd == "size" then
         local w, h = tonumber(a), tonumber(b)
         if not w or not h or w <= 0 or h <= 0 then
-            print("GCDBar: /gcd size <width> <height>")
+            Print("/gcd size <width> <height>")
             return
         end
         db.width, db.height = w, h
@@ -202,13 +293,20 @@ SlashCmdList.GCDBAR = function(msg)
         Refresh()
     elseif cmd == "idle" then
         db.showIdle = not db.showIdle
-        print("GCDBar: idle bar " .. (db.showIdle and "on" or "off"))
+        Print("idle bar " .. (db.showIdle and "on" or "off"))
         Refresh()
+    elseif cmd == "stats" then
+        if db.lastFight then
+            PrintFight(db.lastFight)
+        else
+            Print("no fight recorded yet")
+        end
     elseif cmd == "reset" then
         for k, v in pairs(layoutDefaults) do db[k] = v end
         ApplyLayout()
         Refresh()
     else
-        for _, line in ipairs(HELP) do print("GCDBar: " .. line) end
+        Print("v" .. (C_AddOns.GetAddOnMetadata(ADDON, "Version") or "?"))
+        for _, line in ipairs(HELP) do Print(line) end
     end
 end
