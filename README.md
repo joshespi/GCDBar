@@ -2,6 +2,8 @@
 
 A global cooldown bar for World of Warcraft (retail 12.0). It turns green when you're inside the spell queue window, and prints the % of each fight your GCD sat idle.
 
+![GCDBar during a global cooldown](media/screenshot.png)
+
 ## Install
 
 Install from CurseForge, or copy the `GCDBar` folder into `_retail_/Interface/AddOns/`.
