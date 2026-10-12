@@ -306,7 +306,8 @@ SlashCmdList.GCDBAR = function(msg)
         ApplyLayout()
         Refresh()
     else
-        Print("v" .. (C_AddOns.GetAddOnMetadata(ADDON, "Version") or "?"))
+        local ver = C_AddOns.GetAddOnMetadata(ADDON, "Version") or "?"
+        Print(ver:find("^@") and "dev" or "v" .. (ver:gsub("^v", "")))
         for _, line in ipairs(HELP) do Print(line) end
     end
 end
